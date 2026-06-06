@@ -145,6 +145,7 @@ static const char HTML_INDEX[] PROGMEM = R"rawliteral(
       <div class="stat"><span class="stat-label">MQTT</span><span id="s-mqtt" class="badge">—</span></div>
       <div class="stat"><span class="stat-label">SignalK</span><span id="s-sk" class="badge">—</span></div>
       <div class="stat"><span class="stat-label">NMEA 2000</span><span id="s-n2k" class="badge">—</span></div>
+      <div class="stat" id="s-cerbo-wrap"><span class="stat-label">Cerbo GX</span><span id="s-cerbo" class="badge">—</span></div>
     </div>
   </div>
 
@@ -215,6 +216,21 @@ static const char HTML_INDEX[] PROGMEM = R"rawliteral(
       <div class="field"><label>Preferred source address (0–251)</label><input id="c-n2k-addr" type="number" min="0" max="251"></div>
     </div>
 
+    <div class="subsect">Victron / Cerbo GX</div>
+    <div class="cfg-grid">
+      <div class="field">
+        <label>Follow Cerbo GX relay outputs via N2K</label>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:4px;cursor:pointer;">
+          <input type="checkbox" id="c-cerbo-en" style="width:auto;accent-color:var(--brand);">
+          <span style="font-size:.88rem;">Enable Cerbo following</span>
+        </label>
+      </div>
+      <div class="field"><label>Cerbo switch bank instance (0–252)</label><input id="c-cerbo-inst" type="number" min="0" max="252"></div>
+    </div>
+    <div id="cerbo-hint" style="font-size:.8rem;color:var(--muted);margin-top:4px;display:none;">
+      ⚠ Find the Cerbo's instance in your Axiom device list or via <code>candump can0 | grep 1F00D</code> on the Pi.
+    </div>
+
     <div class="subsect">Relay labels</div>
     <div class="label-grid" id="label-grid"></div>
 
@@ -242,7 +258,8 @@ static const char HTML_INDEX[] PROGMEM = R"rawliteral(
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 var S = {mask:0, di:[], count:8, labels:[], net:{iface:'',ip:'',ssid:''},
-         mqtt_connected:false, sk_connected:false, n2k_running:false};
+         mqtt_connected:false, sk_connected:false, n2k_running:false,
+         cerbo_active:false, cerbo_age_s:0, cerbo_en:false};
 var prevDI = [];
 var relaysDrawn = false;
 var diDrawn = false;
@@ -290,6 +307,11 @@ function paintStatus(){
   set('s-mqtt', badge(S.mqtt_connected?'badge-ok':'badge-err','',S.mqtt_connected?'Connected':'Disconnected'));
   set('s-sk',   badge(S.sk_connected  ?'badge-ok':'badge-err','',S.sk_connected  ?'Connected':'Disconnected'));
   set('s-n2k',  badge(S.n2k_running   ?'badge-ok':'badge-warn','',S.n2k_running  ?'Running':'Offline'));
+  var cw=document.getElementById('s-cerbo-wrap');
+  if(cw)cw.style.display=S.cerbo_en!==false?'':'none';
+  if(S.cerbo_active)set('s-cerbo',badge('badge-ok','','Active &bull; '+S.cerbo_age_s+'s ago'));
+  else if(S.cerbo_en)set('s-cerbo',badge('badge-warn','','No frames'));
+  else set('s-cerbo',badge('badge-muted','','Disabled'));
   var sub='';
   if(S.net.ssid)sub+=S.net.ssid;
   if(S.net.rssi)sub+=' ('+S.net.rssi+' dBm)';
@@ -403,6 +425,11 @@ async function loadCfg(){
     f('c-skuser', d.skuser); f('c-skpass',''); f('c-sktoken','');
     f('c-skvessel',d.skvessel);
     f('c-n2k-inst',d.n2k_inst); f('c-n2k-addr',d.n2k_addr);
+    var ce=document.getElementById('c-cerbo-en');
+    if(ce)ce.checked=!!d.cerbo_en;
+    f('c-cerbo-inst',d.cerbo_inst);
+    var ch=document.getElementById('cerbo-hint');
+    if(ch)ch.style.display=d.cerbo_en?'':'none';
 
     // Token status placeholder
     var t=document.getElementById('c-sktoken');
@@ -440,7 +467,9 @@ function saveCfg(){
     skhost:g('c-skhost'),skport:g('c-skport'),
     skuser:g('c-skuser'),skpass:g('c-skpass'),
     sktoken:g('c-sktoken'),skvessel:g('c-skvessel'),
-    n2k_inst:g('c-n2k-inst'), n2k_addr:g('c-n2k-addr')
+    n2k_inst:g('c-n2k-inst'), n2k_addr:g('c-n2k-addr'),
+    cerbo_en:document.getElementById('c-cerbo-en')?.checked?'1':'0',
+    cerbo_inst:g('c-cerbo-inst')
   });
   for(var i=0;i<8;i++) p.append('rl'+i, g('rl'+i)||('R'+(i+1)));
   fetch('/api/config',{method:'POST',
@@ -503,6 +532,9 @@ String buildStateJson() {
   doc["mqtt_connected"] = mqttIsConnected();
   doc["sk_connected"]   = skIsConnected();
   doc["n2k_running"]    = n2kIsRunning();
+  uint32_t cerboAge = n2kCerboLastSeenMs();
+  doc["cerbo_active"] = g_cfg.cerboN2kEnable && cerboAge > 0 && cerboAge < 5000;
+  doc["cerbo_age_s"]  = cerboAge / 1000;
 
   uint8_t di = readDI_mask();
   doc["di_mask"] = di;
@@ -585,8 +617,10 @@ static void handleGetConfig() {
   doc["sk_has_token"]= g_cfg.skToken.length() > 0;
   doc["sk_denied"]   = skAccessDenied();
   // N2K
-  doc["n2k_inst"] = g_cfg.n2kDeviceInstance;
-  doc["n2k_addr"] = g_cfg.n2kSourceAddress;
+  doc["n2k_inst"]      = g_cfg.n2kDeviceInstance;
+  doc["n2k_addr"]      = g_cfg.n2kSourceAddress;
+  doc["cerbo_en"]      = g_cfg.cerboN2kEnable;
+  doc["cerbo_inst"]    = g_cfg.cerboN2kInstance;
   // Relay labels
   JsonArray lblArr = doc["labels"].to<JsonArray>();
   for (uint8_t i = 0; i < BoardPins::RELAY_COUNT; ++i) lblArr.add(g_cfg.relayLabels[i]);
@@ -629,6 +663,10 @@ static void handlePostConfig() {
     g_cfg.n2kDeviceInstance = (uint8_t)constrain(server.arg("n2k_inst").toInt(), 0, 252);
   if (server.hasArg("n2k_addr") && server.arg("n2k_addr").length())
     g_cfg.n2kSourceAddress  = (uint8_t)constrain(server.arg("n2k_addr").toInt(), 0, 251);
+  if (server.hasArg("cerbo_en"))
+    g_cfg.cerboN2kEnable = server.arg("cerbo_en") == "1";
+  if (server.hasArg("cerbo_inst") && server.arg("cerbo_inst").length())
+    g_cfg.cerboN2kInstance = (uint8_t)constrain(server.arg("cerbo_inst").toInt(), 0, 252);
   // Relay labels
   for (uint8_t i = 0; i < BoardPins::RELAY_COUNT; ++i) {
     char key[4]; snprintf(key, sizeof(key), "rl%d", i);

@@ -75,6 +75,14 @@
   #define DEFAULT_N2K_SOURCE_ADDRESS   35
 #endif
 
+// Cerbo GX N2K integration
+#ifndef DEFAULT_CERBO_N2K_ENABLE
+  #define DEFAULT_CERBO_N2K_ENABLE     false
+#endif
+#ifndef DEFAULT_CERBO_N2K_INSTANCE
+  #define DEFAULT_CERBO_N2K_INSTANCE   0
+#endif
+
 #include "BoardPins.h"
 
 // ── Runtime config struct ─────────────────────────────────────────────────────
@@ -110,6 +118,10 @@ struct AppConfig {
   // NMEA 2000
   uint8_t  n2kDeviceInstance;
   uint8_t  n2kSourceAddress;
+
+  // Cerbo GX — follow Cerbo relay outputs via N2K PGN 127501
+  bool     cerboN2kEnable;     // enable/disable Cerbo following
+  uint8_t  cerboN2kInstance;   // Cerbo's switch bank device instance on the bus
 
   // Relay labels — user-editable names shown on buttons
   String   relayLabels[BoardPins::RELAY_COUNT];

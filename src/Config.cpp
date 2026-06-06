@@ -76,6 +76,11 @@ void configLoad() {
   if (g_cfg.n2kDeviceInstance > 252) g_cfg.n2kDeviceInstance = DEFAULT_N2K_DEVICE_INSTANCE;
   if (g_cfg.n2kSourceAddress  > 251) g_cfg.n2kSourceAddress  = DEFAULT_N2K_SOURCE_ADDRESS;
 
+  // ── Cerbo GX ────────────────────────────────────────────────────────────────
+  g_cfg.cerboN2kEnable   = p.getBool("cerbo_en",   DEFAULT_CERBO_N2K_ENABLE);
+  g_cfg.cerboN2kInstance = (uint8_t)p.getUInt("cerbo_inst", DEFAULT_CERBO_N2K_INSTANCE);
+  if (g_cfg.cerboN2kInstance > 252) g_cfg.cerboN2kInstance = DEFAULT_CERBO_N2K_INSTANCE;
+
   // ── Relay labels ─────────────────────────────────────────────────────────────
   for (uint8_t i = 0; i < BoardPins::RELAY_COUNT; ++i) {
     char key[6]; snprintf(key, sizeof(key), "rl%d", i);
@@ -126,6 +131,9 @@ void configSave() {
   p.putUInt("n2k_inst", g_cfg.n2kDeviceInstance);
   p.putUInt("n2k_addr", g_cfg.n2kSourceAddress);
 
+  p.putBool("cerbo_en",   g_cfg.cerboN2kEnable);
+  p.putUInt("cerbo_inst", g_cfg.cerboN2kInstance);
+
   for (uint8_t i = 0; i < BoardPins::RELAY_COUNT; ++i) {
     char key[6]; snprintf(key, sizeof(key), "rl%d", i);
     p.putString(key, g_cfg.relayLabels[i]);
@@ -158,6 +166,8 @@ void configReset() {
   g_cfg.skVesselName       = DEFAULT_SK_VESSEL_NAME;
   g_cfg.n2kDeviceInstance  = DEFAULT_N2K_DEVICE_INSTANCE;
   g_cfg.n2kSourceAddress   = DEFAULT_N2K_SOURCE_ADDRESS;
+  g_cfg.cerboN2kEnable     = DEFAULT_CERBO_N2K_ENABLE;
+  g_cfg.cerboN2kInstance   = DEFAULT_CERBO_N2K_INSTANCE;
   for (uint8_t i = 0; i < BoardPins::RELAY_COUNT; ++i) {
     char def[4]; snprintf(def, sizeof(def), "R%d", i + 1);
     g_cfg.relayLabels[i] = String(def);
