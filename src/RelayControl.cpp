@@ -7,11 +7,13 @@
 
 extern RgbLed rgb;
 
-// Forward declarations — MqttManager and SignalKClient publish on state change
+// Forward declarations — publish on state change
 void mqttPublishRelayState(uint8_t idx);
 void mqttPublishAllRelayStates();
 void skPublishRelayState(uint8_t idx);
 void skPublishAllRelayStates();
+void n2kRequestPublish();          // N2kManager.cpp — safe to call from any task
+
 extern bool g_mqtt_connected;
 extern bool skIsConnected();
 
@@ -36,10 +38,11 @@ void relaySet(uint8_t idx, bool on) {
   s_tca.write1(idx, on ? HIGH : LOW);
   if (on) s_mask |= (1u << idx);
   else    s_mask &= ~(1u << idx);
-  rgb.setRelayMask(s_mask);   // triggers white activity pulse
+  rgb.setRelayMask(s_mask);
   LOGf("[RELAY] R%d %s", idx + 1, on ? "ON" : "OFF");
   if (g_mqtt_connected) mqttPublishRelayState(idx);
   if (skIsConnected())  skPublishRelayState(idx);
+  n2kRequestPublish();
 }
 
 void relayApplyMask(uint8_t mask) {
@@ -51,9 +54,10 @@ void relayApplyMask(uint8_t mask) {
     if (diff & (1u << i)) LOGf("[RELAY] R%d %s", i + 1, on ? "ON" : "OFF");
   }
   s_mask = mask;
-  rgb.setRelayMask(s_mask);   // triggers white activity pulse
+  rgb.setRelayMask(s_mask);
   if (g_mqtt_connected) mqttPublishAllRelayStates();
   if (skIsConnected())  skPublishAllRelayStates();
+  n2kRequestPublish();
 }
 
 uint8_t relayGetMask() { return s_mask; }

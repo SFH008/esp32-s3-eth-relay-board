@@ -3,8 +3,6 @@
 #include <Preferences.h>
 
 // ── Compile-time defaults ─────────────────────────────────────────────────────
-// All NVS-backed values can be overridden at runtime via the web UI config card.
-
 #ifndef DEFAULT_WIFI_SSID
   #define DEFAULT_WIFI_SSID        "Network_2.4"
 #endif
@@ -55,26 +53,42 @@
   #define DEFAULT_SK_VESSEL_NAME   "relayboard_can"
 #endif
 
-// Static Ethernet IP (not NVS-backed — change requires reflash)
-#ifndef ETH_STATIC_IP
-  #define ETH_STATIC_IP            "192.168.76.220"
+// Ethernet static IP — NVS-backed; no reflash needed to change.
+#ifndef DEFAULT_ETH_IP
+  #define DEFAULT_ETH_IP           "192.168.76.220"
 #endif
-#ifndef ETH_GATEWAY
-  #define ETH_GATEWAY              "192.168.76.1"
+#ifndef DEFAULT_ETH_GW
+  #define DEFAULT_ETH_GW           "192.168.76.1"
 #endif
-#ifndef ETH_SUBNET
-  #define ETH_SUBNET               "255.255.255.0"
+#ifndef DEFAULT_ETH_SN
+  #define DEFAULT_ETH_SN           "255.255.255.0"
 #endif
-#ifndef ETH_DNS
-  #define ETH_DNS                  "192.168.76.1"
+#ifndef DEFAULT_ETH_DNS
+  #define DEFAULT_ETH_DNS          "192.168.76.1"
 #endif
+
+// NMEA 2000
+#ifndef DEFAULT_N2K_DEVICE_INSTANCE
+  #define DEFAULT_N2K_DEVICE_INSTANCE  0
+#endif
+#ifndef DEFAULT_N2K_SOURCE_ADDRESS
+  #define DEFAULT_N2K_SOURCE_ADDRESS   35
+#endif
+
+#include "BoardPins.h"
 
 // ── Runtime config struct ─────────────────────────────────────────────────────
 struct AppConfig {
-  // Network
+  // Network — WiFi
   String wifiSsid;
   String wifiPass;
   String hostname;
+
+  // Network — Ethernet static IP
+  String   ethIp;
+  String   ethGateway;
+  String   ethSubnet;
+  String   ethDns;
 
   // MQTT
   String   mqttBroker;
@@ -85,23 +99,24 @@ struct AppConfig {
   String   mqttBaseTopic;
 
   // SignalK
-  String   skServer;      // IP or hostname of the SignalK server
-  uint16_t skPort;        // default 3000
-  String   skToken;       // Bearer token — obtained via device access request
-  String   skUser;        // optional: admin username for /auth/login fallback
-  String   skPass;        // optional: admin password for /auth/login fallback
-  String   skClientId;    // stable device UUID stored in NVS (auto-generated from MAC)
-  String   skVesselName;  // used as source.label in delta messages
+  String   skServer;
+  uint16_t skPort;
+  String   skToken;
+  String   skUser;
+  String   skPass;
+  String   skClientId;
+  String   skVesselName;
+
+  // NMEA 2000
+  uint8_t  n2kDeviceInstance;
+  uint8_t  n2kSourceAddress;
+
+  // Relay labels — user-editable names shown on buttons
+  String   relayLabels[BoardPins::RELAY_COUNT];
 };
 
-// Global instance — defined in Config.cpp
 extern AppConfig g_cfg;
 
-// Load from NVS, falling back to compile-time defaults for absent keys
 void configLoad();
-
-// Persist g_cfg to NVS
 void configSave();
-
-// Reset all NVS keys to compile-time defaults and save
 void configReset();

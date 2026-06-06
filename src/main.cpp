@@ -1,17 +1,23 @@
 /*
-  main.cpp — Waveshare ESP32-S3-ETH-8DI-8RO  (Arduino core 3.x / pioarduino)
+  main.cpp — Waveshare ESP32-S3-ETH-8DI-8RO-C  (Arduino core 3.x / pioarduino)
+
+  Changes vs original:
+    1. Ethernet static IP/GW/SN/DNS now read from g_cfg (NVS-backed) instead of
+       compile-time #defines — no reflash needed to change network settings.
+    2. N2K (NMEA 2000) task started via n2kStart() alongside MQTT and SignalK.
+       Uses the on-board isolated TWAI transceiver (GPIO17 TX, GPIO18 RX).
 
   Module responsibilities:
     Logger.cpp        — UILogger ring buffer, ESP-IDF log bridge, LOG/LOGf macros
-    Config.cpp        — NVS-backed runtime config (WiFi, MQTT, SignalK, hostname)
-    RelayControl.cpp  — TCA9554 relay driver; notifies MQTT + SignalK on change
+    Config.cpp        — NVS-backed runtime config (WiFi, MQTT, SignalK, ETH IP, N2K)
+    RelayControl.cpp  — TCA9554 relay driver; notifies MQTT, SignalK, N2K on change
     MqttManager.cpp   — MQTT on FreeRTOS core 0 task
     SignalKClient.cpp — SignalK WebSocket delta client on FreeRTOS core 0 task
+    N2kManager.cpp    — NMEA 2000 TWAI CAN on FreeRTOS core 0 task
     HttpHandlers.cpp  — WebServer routes, ArduinoJson state/config builders
     main.cpp          — Network bringup, failover, DI polling (core 1)
 
   Network priority: Ethernet (W5500 SPI) → WiFi STA → WiFi AP fallback.
-  MQTT used as fallback when SignalK WebSocket is unavailable.
 */
 
 #include <Arduino.h>
@@ -28,6 +34,7 @@
 #include "RelayControl.h"
 #include "MqttManager.h"
 #include "SignalKClient.h"
+#include "N2kManager.h"
 #include "HttpHandlers.h"
 #include "RgbLed_WS2812.h"
 
@@ -39,7 +46,6 @@ enum NetMode : uint8_t { MODE_NONE, MODE_AP, MODE_WIFI, MODE_ETH };
 uint8_t g_mode = MODE_NONE;
 
 // ── Digital inputs ────────────────────────────────────────────────────────────
-// Defined here; called from RelayControl, MqttManager, SignalKClient via extern
 uint8_t readDI_mask() {
   uint8_t m = 0;
   for (uint8_t i = 0; i < BoardPins::DI_COUNT; ++i)
@@ -60,9 +66,23 @@ static void onEthEvent(arduino_event_id_t event, arduino_event_info_t) {
   }
 }
 
-// ── Network bringup ───────────────────────────────────────────────────────────
+// ── ETH helpers — now use g_cfg instead of compile-time #defines ──────────────
+static bool applyEthConfig() {
+  IPAddress ip, gw, sn, dns;
+  if (!ip.fromString(g_cfg.ethIp)      ||
+      !gw.fromString(g_cfg.ethGateway) ||
+      !sn.fromString(g_cfg.ethSubnet)  ||
+      !dns.fromString(g_cfg.ethDns)) {
+    LOG("[ETH] Invalid IP config in NVS — check eth_ip/eth_gw/eth_sn/eth_dns");
+    return false;
+  }
+  ETH.config(ip, gw, sn, dns);
+  uint32_t t0 = millis();
+  while (ETH.localIP() == IPAddress(0,0,0,0) && (millis() - t0) < 4000) delay(100);
+  return ETH.localIP() != IPAddress(0,0,0,0);
+}
 
-// Called ONCE in setup() — initialises SPI and ETH driver
+// Called ONCE in setup() — initialises SPI and ETH driver.
 static bool ethInit() {
   LOG("[ETH] Starting W5500...");
   SPI.begin(BoardPins::SPI_SCLK, BoardPins::SPI_MISO,
@@ -80,36 +100,20 @@ static bool ethInit() {
   while (!ETH.linkUp() && (millis() - t0) < 5000) delay(50);
   if (!ETH.linkUp()) { LOG("[ETH] No link"); return false; }
 
-  IPAddress ip, gw, sn, dns;
-  ip.fromString(ETH_STATIC_IP); gw.fromString(ETH_GATEWAY);
-  sn.fromString(ETH_SUBNET);    dns.fromString(ETH_DNS);
-  ETH.config(ip, gw, sn, dns);
-
-  t0 = millis();
-  while (ETH.localIP() == IPAddress(0,0,0,0) && (millis() - t0) < 4000) delay(100);
-  if (ETH.localIP() == IPAddress(0,0,0,0)) { LOG("[ETH] No IP"); return false; }
+  if (!applyEthConfig()) { LOG("[ETH] No IP"); return false; }
 
   LOGf("[ETH] Ready: %s", ETH.localIP().toString().c_str());
   return true;
 }
 
-// Called on failover BACK to ETH — does NOT re-init SPI or ETH driver,
-// just waits for the link to recover and re-applies the static IP.
+// Called on failover BACK to ETH — does NOT re-init SPI or driver.
 static bool ethReconnect() {
   LOG("[ETH] Waiting for link recovery...");
   uint32_t t0 = millis();
   while (!ETH.linkUp() && (millis() - t0) < 8000) delay(100);
   if (!ETH.linkUp()) { LOG("[ETH] Link did not recover"); return false; }
 
-  // Re-apply static IP — link recovery can clear it
-  IPAddress ip, gw, sn, dns;
-  ip.fromString(ETH_STATIC_IP); gw.fromString(ETH_GATEWAY);
-  sn.fromString(ETH_SUBNET);    dns.fromString(ETH_DNS);
-  ETH.config(ip, gw, sn, dns);
-
-  uint32_t t1 = millis();
-  while (ETH.localIP() == IPAddress(0,0,0,0) && (millis() - t1) < 4000) delay(100);
-  if (ETH.localIP() == IPAddress(0,0,0,0)) { LOG("[ETH] No IP after recovery"); return false; }
+  if (!applyEthConfig()) { LOG("[ETH] No IP after recovery"); return false; }
 
   LOGf("[ETH] Recovered: %s", ETH.localIP().toString().c_str());
   return true;
@@ -174,7 +178,6 @@ void setup() {
 
   configLoad();
 
-  // Register ETH events once before ETH.begin
   Network.onEvent(onEthEvent);
 
   // Network — priority: ETH → WiFi STA → AP
@@ -195,6 +198,7 @@ void setup() {
   if (g_mode != MODE_AP) {
     mqttStart();
     skStart();
+    n2kStart();   // ← NMEA 2000 task; independent of network mode
   }
 
   rgb.setForMask((uint8_t)g_mode);
@@ -215,12 +219,12 @@ void loop() {
   ArduinoOTA.handle();
   rgb.tick();
 
-  // ── SignalK token refresh — handled here on core 1, never inside the SK task
+  // ── SignalK token refresh
   if (skTokenRefreshNeeded() && !skAccessDenied()) {
     LOG("[NET] SK token rejected (403) — submitting new device access request");
     skStop();
-    skRequestAccess();  // blocking HTTP + poll — safe on core 1
-    skStart();          // restart task with updated token
+    skRequestAccess();
+    skStart();
   }
 
   // ── Network failover (800 ms debounce) ─────────────────────────────────────
@@ -263,8 +267,8 @@ void loop() {
 
   // ── Digital input polling @ 50 ms with one-poll debounce ───────────────────
   static uint32_t lastDIPoll  = 0;
-  static uint8_t  prevDI      = readDI_mask();  // initialised from hardware
-  static uint8_t  candidateDI = 0;              // reading from last poll
+  static uint8_t  prevDI      = readDI_mask();
+  static uint8_t  candidateDI = 0;
   static bool     firstPoll   = true;
 
   if (now - lastDIPoll >= 50) {
@@ -272,11 +276,9 @@ void loop() {
     uint8_t curDI = readDI_mask();
 
     if (firstPoll) {
-      // Swallow the first poll — just capture stable baseline
       candidateDI = curDI;
       firstPoll   = false;
     } else if (curDI == candidateDI && curDI != prevDI) {
-      // Reading stable across two consecutive polls — treat as real event
       for (uint8_t i = 0; i < BoardPins::DI_COUNT; ++i) {
         bool was = (prevDI >> i) & 1, is = (curDI >> i) & 1;
         if (was != is) {
@@ -287,9 +289,9 @@ void loop() {
       }
       mqttPublishAllInputStates();
       skPublishAllInputStates();
+      n2kRequestPublish();   // ← trigger N2K publish on DI change
       prevDI = curDI;
     } else {
-      // Reading changed or is new — store as candidate, check next poll
       candidateDI = curDI;
     }
   }
