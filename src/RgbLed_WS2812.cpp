@@ -24,7 +24,7 @@ static CRGB modeColour(uint8_t mode) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 void RgbLed::begin() {
-  FastLED.addLeds<WS2812, BoardPins::RGB_LED, GRB>(s_leds, 1);
+  FastLED.addLeds<WS2812, BoardPins::RGB_LED, RGB>(s_leds, 1);
   FastLED.setBrightness(MAX_BRIGHTNESS);
   FastLED.clear(true);
 }

@@ -200,18 +200,25 @@ static void handlePut(const JsonObject& put) {
 // Timestamp is included so the server doesn't have to fill it in.
 
 static String isoTimestamp() {
-  // Simple ISO-8601 timestamp from millis — good enough for SK
-  // Format: 2000-01-01T00:00:00.000Z (offset from epoch, not wall clock)
-  // SignalK server overwrites with real time anyway; we just need the field present
-  uint32_t ms = millis();
-  uint32_t s  = ms / 1000;
-  char buf[28];
-  snprintf(buf, sizeof(buf), "1970-01-01T%02u:%02u:%02u.%03uZ",
-           (unsigned)((s / 3600) % 24),
-           (unsigned)((s / 60)   % 60),
-           (unsigned)(s % 60),
-           (unsigned)(ms % 1000));
-  return String(buf);
+  time_t now = time(nullptr);
+  if (now < 1700000000) {  // before ~Nov 2023 — SNTP hasn't synced yet, fall back
+    uint32_t ms = millis();
+    uint32_t s  = ms / 1000;
+    char buf[28];
+    snprintf(buf, sizeof(buf), "1970-01-01T%02u:%02u:%02u.%03uZ",
+             (unsigned)((s / 3600) % 24),
+             (unsigned)((s / 60)   % 60),
+             (unsigned)(s % 60),
+             (unsigned)(ms % 1000));
+    return String(buf);
+  }
+  struct tm timeinfo;
+  gmtime_r(&now, &timeinfo);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+  char full[40];
+  snprintf(full, sizeof(full), "%s.%03uZ", buf, (unsigned)(millis() % 1000));
+  return String(full);
 }
 
 static String buildRelayDelta(uint8_t idxMask, uint8_t stateMask) {

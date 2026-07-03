@@ -109,30 +109,37 @@ static void mqttReconnect() {
 // ── FreeRTOS task ─────────────────────────────────────────────────────────────
 static void mqttTask(void*) {
   for (;;) {
+    // Only take the mutex to check connection state — never hold it across
+    // a blocking call. mqttReconnect() can block for up to
+    // MQTT_SOCKET_TIMEOUT seconds inside connect(); if we held s_mutex
+    // during that, any HTTP handler calling mqttPublishRelayState() would
+    // stall for the same duration waiting on the mutex.
     xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
+    bool connected = s_mqtt.connected();
+    xSemaphoreGiveRecursive(s_mutex);
 
-    if (!s_mqtt.connected()) {
+    if (!connected) {
       g_mqtt_connected = false;
-      mqttReconnect();  // mqttReconnect takes s_mutex internally via publish helpers
-                        // — safe because s_mutex is recursive
+      mqttReconnect();  // blocks without holding s_mutex
     } else {
+      xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
       g_mqtt_connected = true;
       s_mqtt.loop();
       if (millis() - s_lastStatePub > STATE_PUB_INTERVAL_MS) {
         s_lastStatePub = millis();
-        // Publish directly — mutex already held by this task (recursive take is fine)
         uint8_t mask = relayGetMask();
         for (uint8_t i = 0; i < BoardPins::RELAY_COUNT; i++) {
           String topic = g_cfg.mqttBaseTopic + "/relay/" + String(i + 1) + "/state";
           s_mqtt.publish(topic.c_str(), (mask >> i) & 1 ? "ON" : "OFF", true);
         }
       }
+      xSemaphoreGiveRecursive(s_mutex);
     }
 
-    xSemaphoreGiveRecursive(s_mutex);
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
+
 
 // ── Public API ────────────────────────────────────────────────────────────────
 void mqttStart() {
@@ -149,7 +156,7 @@ void mqttStart() {
   s_mqtt.setServer(brokerIP, g_cfg.mqttPort);
   s_mqtt.setCallback(mqttCallback);
   s_mqtt.setKeepAlive(60);
-  s_mqtt.setSocketTimeout(1);
+  s_mqtt.setSocketTimeout(10);
 
   // Pin MQTT task to core 0; main loop runs on core 1
   xTaskCreatePinnedToCore(

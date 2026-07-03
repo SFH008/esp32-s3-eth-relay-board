@@ -30,6 +30,7 @@
 #include "SignalKClient.h"
 #include "HttpHandlers.h"
 #include "RgbLed_WS2812.h"
+#include "time.h"
 
 // ── RGB LED ───────────────────────────────────────────────────────────────────
 RgbLed rgb;
@@ -123,6 +124,7 @@ static bool bringupWiFi_() {
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 15000) delay(250);
   if (WiFi.status() == WL_CONNECTED) {
+    WiFi.setSleep(false);   // <-- disable modem sleep, fixes intermittent socket stalls
     LOGf("[WiFi] %s  RSSI: %d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
     return true;
   }
@@ -186,6 +188,9 @@ void setup() {
   rgb.begin();
   rgb.setHeartbeatEnabled(true);
   BoardPins::configInputs();
+
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // UTC, no DST offset — good for marine/UTC logging
+  LOG("[TIME] SNTP sync requested");
 
   startServer();
   otaBegin();
