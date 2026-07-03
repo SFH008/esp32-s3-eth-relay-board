@@ -6,7 +6,7 @@
 // All NVS-backed values can be overridden at runtime via the web UI config card.
 
 #ifndef DEFAULT_WIFI_SSID
-  #define DEFAULT_WIFI_SSID        "Network_2.4"
+  #define DEFAULT_WIFI_SSID        "Dots_Starlink24"
 #endif
 #ifndef DEFAULT_WIFI_PASS
   #define DEFAULT_WIFI_PASS        "dots1234"
@@ -17,7 +17,7 @@
 
 // MQTT
 #ifndef DEFAULT_MQTT_BROKER
-  #define DEFAULT_MQTT_BROKER      "192.168.76.171"
+  #define DEFAULT_MQTT_BROKER      "192.168.2.120"
 #endif
 #ifndef DEFAULT_MQTT_PORT
   #define DEFAULT_MQTT_PORT        1883
@@ -37,7 +37,7 @@
 
 // SignalK
 #ifndef DEFAULT_SK_SERVER
-  #define DEFAULT_SK_SERVER        "192.168.76.171"
+  #define DEFAULT_SK_SERVER        "192.168.2.120"
 #endif
 #ifndef DEFAULT_SK_PORT
   #define DEFAULT_SK_PORT          3000
@@ -57,16 +57,16 @@
 
 // Static Ethernet IP (not NVS-backed — change requires reflash)
 #ifndef ETH_STATIC_IP
-  #define ETH_STATIC_IP            "192.168.76.220"
+  #define ETH_STATIC_IP            "192.168.2.220"
 #endif
 #ifndef ETH_GATEWAY
-  #define ETH_GATEWAY              "192.168.76.1"
+  #define ETH_GATEWAY              "192.168.2.1"
 #endif
 #ifndef ETH_SUBNET
   #define ETH_SUBNET               "255.255.255.0"
 #endif
 #ifndef ETH_DNS
-  #define ETH_DNS                  "192.168.76.1"
+  #define ETH_DNS                  "192.168.2.1"
 #endif
 
 // ── Runtime config struct ─────────────────────────────────────────────────────
