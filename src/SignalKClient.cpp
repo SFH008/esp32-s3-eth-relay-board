@@ -86,7 +86,7 @@ static void      wsEventHandler(WStype_t type, uint8_t* payload, size_t length);
 static void      sendDelta(String json);
 static String    buildRelayDelta(uint8_t idxMask, uint8_t stateMask);
 static String    buildInputDelta(uint8_t idxMask, uint8_t di_mask);
-static void      handlePut(const JsonObject& put);
+static void      handlePut(const JsonObject& put, const char* requestId);
 static void      drainQueue();
 static void      skTask(void*);
 bool             skLoginFallback();  // fallback for servers using /auth/login
@@ -107,18 +107,13 @@ static void wsEventHandler(WStype_t type, uint8_t* payload, size_t length) {
       LOG("[SK] Disconnected");
       break;
 
-    case WStype_CONNECTED:
-      LOGf("[SK] WebSocket connected to %s", (char*)payload);
-      if (g_cfg.skToken.length() > 0) {
-        s_state = SK_AUTHENTICATING;
-        LOGf("[SK] Token present (%u chars) — will authenticate", g_cfg.skToken.length());
-      } else {
-        LOG("[SK] No token configured — proceeding unauthenticated");
-        s_state           = SK_RUNNING;
-        s_connected       = true;
-        s_snapshotPending = true;  // task loop sends snapshot safely after loop() returns
-      }
-      break;
+  case WStype_CONNECTED:
+    LOGf("[SK] WebSocket connected to %s", (char*)payload);
+    s_state           = SK_RUNNING;
+    s_connected       = true;
+    s_snapshotPending = true;
+    LOG("[SK] Running (authenticated via header)");
+    break;
 
     case WStype_TEXT: {
       JsonDocument doc;
@@ -126,17 +121,20 @@ static void wsEventHandler(WStype_t type, uint8_t* payload, size_t length) {
       if (err) { LOGf("[SK] JSON parse error: %s", err.c_str()); break; }
 
       if (s_state == SK_AUTHENTICATING) {
-        int code = doc["statusCode"] | 0;
-        if (code == 200 || code == 0) {
+        if (!doc["statusCode"].is<int>()) {
+          // Not an auth response (likely the server's initial "hello" envelope) — ignore and keep waiting
+          LOGf("[SK] Non-auth message while authenticating (ignored): %.100s", (char*)payload);
+          break;
+        }
+        int code = doc["statusCode"];
+        if (code == 200) {
           s_state           = SK_RUNNING;
           s_connected       = true;
-          s_snapshotPending = true;  // task loop sends snapshot safely
+          s_snapshotPending = true;
           LOG("[SK] Authenticated — running");
         } else {
           LOGf("[SK] Auth rejected: %d %s", code,
-               doc["message"].as<const char*>() ?: "");
-          // Flag refresh needed — skStart()/loop() will call skRequestToken()
-          // then reconnect with the new token
+              doc["message"].as<const char*>() ?: "");
           s_tokenRefreshNeeded = true;
           s_state              = SK_DISCONNECTED;
           s_connected          = false;
@@ -146,7 +144,8 @@ static void wsEventHandler(WStype_t type, uint8_t* payload, size_t length) {
 
       // Running — handle put requests
       if (doc["put"].is<JsonObject>()) {
-        handlePut(doc["put"]);
+        const char* reqId = doc["requestId"] | "";
+        handlePut(doc["put"], reqId);
       }
 
       if (doc["requestId"].is<const char*>() && doc["state"].is<const char*>()) {
@@ -167,16 +166,18 @@ static void wsEventHandler(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 // ── Put request handler ───────────────────────────────────────────────────────
-static void handlePut(const JsonObject& put) {
+static void handlePut(const JsonObject& put, const char* requestId) {
   const char* path = put["path"];
   if (!path) return;
 
   String p = String(path);
   LOGf("[SK] Put: %s = %s", path, put["value"].as<String>().c_str());
 
-  // Match electrical.switches.bank.relays.<N>.state
   const String relayPrefix = "electrical.switches.bank.relays.";
   const String inputPrefix = "electrical.switches.bank.inputs.";
+
+  bool handled = false;
+  int  statusCode = 400;
 
   if (p.startsWith(relayPrefix) && p.endsWith(".state")) {
     String numStr = p.substring(relayPrefix.length(), p.length() - strlen(".state"));
@@ -184,10 +185,24 @@ static void handlePut(const JsonObject& put) {
     if (rn >= 1 && rn <= (int)BoardPins::RELAY_COUNT) {
       bool on = put["value"].as<bool>();
       relaySet((uint8_t)(rn - 1), on);
+      handled = true;
+      statusCode = 200;
     }
-  }
-  else if (p.startsWith(inputPrefix)) {
+  } else if (p.startsWith(inputPrefix)) {
     LOG("[SK] Put ignored: digital inputs are read-only");
+    statusCode = 405;  // method not allowed — read-only path
+  }
+
+  // Acknowledge back to the server with the matching requestId, per the
+  // Signal K PUT protocol — without this, callers may treat the request
+  // as timed out even though the relay switched.
+  if (requestId && requestId[0] != '\0') {
+    JsonDocument resp;
+    resp["requestId"]  = requestId;
+    resp["state"]      = handled ? "COMPLETED" : "COMPLETED";  // COMPLETED either way; statusCode conveys result
+    resp["statusCode"] = statusCode;
+    String out; serializeJson(resp, out);
+    sendDelta(out);  // reuse existing WS send helper
   }
 }
 
@@ -511,6 +526,27 @@ static void skTask(void*) {
            g_cfg.skServer.c_str(), g_cfg.skPort, SK_PATH);
       s_state = SK_CONNECTING;
       xSemaphoreTake(s_wsMutex, portMAX_DELAY);
+
+    if (s_state == SK_DISCONNECTED &&
+        (millis() - lastConnectAttempt) >= RECONNECT_INTERVAL_MS) {
+      lastConnectAttempt = millis();
+      tokenSent          = false;
+      LOGf("[SK] Connecting to ws://%s:%u%s",
+          g_cfg.skServer.c_str(), g_cfg.skPort, SK_PATH);
+      s_state = SK_CONNECTING;
+
+      xSemaphoreTake(s_wsMutex, portMAX_DELAY);
+      if (g_cfg.skToken.length() > 0) {
+        String authHeader = "Authorization: Bearer " + g_cfg.skToken;
+        s_ws.setExtraHeaders(authHeader.c_str());
+        LOGf("[SK] Connecting with auth header (%u char token)", g_cfg.skToken.length());
+      } else {
+        s_ws.setExtraHeaders("");  // no token — anonymous connect
+      }
+      s_ws.begin(g_cfg.skServer.c_str(), g_cfg.skPort, SK_PATH);
+      xSemaphoreGive(s_wsMutex);
+    }
+
       s_ws.begin(g_cfg.skServer.c_str(), g_cfg.skPort, SK_PATH);
       xSemaphoreGive(s_wsMutex);
     }

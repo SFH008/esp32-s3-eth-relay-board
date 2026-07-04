@@ -1,0 +1,6 @@
+{
+    "clangd.arguments": [
+        "--compile-commands-dir=/projects/esp32-s3-eth-relay-board/.cache/clangd",
+        "--query-driver=/config/.platformio/packages/toolchain-*/bin/*,/config/.platformio/packages/tool-*/bin/*"
+    ]
+}
