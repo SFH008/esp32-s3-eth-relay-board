@@ -5,11 +5,12 @@
 #include "RelayControl.h"
 #include "MqttManager.h"
 #include "SignalKClient.h"
+#include "ShellyRpc.h"
 #include <ETH.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
 
-WebServer server(80);
+RelayWebServer server(80);
 
 extern uint8_t g_mode;
 enum NetMode : uint8_t { MODE_NONE, MODE_AP, MODE_WIFI, MODE_ETH };
@@ -115,6 +116,10 @@ static const char HTML_INDEX[] PROGMEM = R"rawliteral(
       <div><div class="cfg-label">Base topic</div><input id="cfg-mtopic" type="text"></div>
     </div>
 
+    <div class="subsection">Victron Shelly compatibility</div>
+    <label><input id="cfg-shelly" type="checkbox"> Enable eight Shelly-compatible switches</label>
+    <div class="cfg-label">Discovery name: <span id="shelly-id"></span>. Changes apply after reboot.</div>
+
     <div class="subsection">SignalK</div>
     <div class="cfg-grid">
       <div><div class="cfg-label">Server IP / hostname</div><input id="cfg-skhost" type="text"></div>
@@ -187,6 +192,12 @@ function drawRelays(){var w=document.getElementById('buttons'),h='';
           b.textContent='R'+(i+1)+': '+(cur?'ON':'OFF');
           if(cur)S.mask|=(1<<i);else S.mask&=~(1<<i);paintHdr();msg('Error: '+e.message);});});}}
 
+function paintRelays(){for(let i=0;i<S.count;i++){
+  const b=document.getElementById('r'+i);if(!b)continue;
+  const on=!!(S.mask&(1<<i));
+  b.setAttribute('data-s',on?'1':'0');b.classList.toggle('active',on);
+  b.textContent='R'+(i+1)+': '+(on?'ON':'OFF');}}
+
 function drawInputs(){var w=document.getElementById('inputs'),h='';
   for(var i=0;i<S.di.length;i++)
     h+='<div class="di-pill"><div class="dot '+(S.di[i]===0?'high':'')+'" id="d'+i+'"></div><div>DI'+(i+1)+'</div></div>';
@@ -204,7 +215,7 @@ function paintHdr(){
   badge('sk',S.sk_connected);}
 
 function refresh(){fetch('/api/state').then(r=>r.json()).then(j=>{S=j;paintHdr();
-  if(!document.getElementById('r0'))drawRelays();
+  if(!document.getElementById('r0'))drawRelays();paintRelays();
   if(!document.getElementById('d0'))drawInputs();paintInputs();
   if(prevDI.length===S.di.length)for(let i=0;i<S.di.length;i++)
     if(S.di[i]!==prevDI[i])msg('DI'+(i+1)+' → '+(S.di[i]===0?'ACTIVE':'INACTIVE'));
@@ -213,6 +224,8 @@ function refresh(){fetch('/api/state').then(r=>r.json()).then(j=>{S=j;paintHdr()
 async function loadCfg(){try{
   const r=await fetch('/api/config');const d=await r.json();
   var f=(id,v)=>{var e=document.getElementById(id);if(e)e.value=v||'';};
+  document.getElementById('cfg-shelly').checked=d.shelly_enabled;
+  document.getElementById('shelly-id').textContent=d.shelly_id;
   f('cfg-ssid',d.ssid);f('cfg-wpass','');f('cfg-host',d.host);
   f('cfg-mbroker',d.mbroker);f('cfg-mport',d.mport);
   f('cfg-muser',d.muser);f('cfg-mpass','');
@@ -232,6 +245,7 @@ async function loadCfg(){try{
 function saveCfg(){
   var g=(id)=>document.getElementById(id)?.value||'';
   var body=new URLSearchParams({
+    shelly:document.getElementById('cfg-shelly').checked?'1':'0',
     ssid:g('cfg-ssid'),wpass:g('cfg-wpass'),host:g('cfg-host'),
     mbroker:g('cfg-mbroker'),mport:g('cfg-mport'),
     muser:g('cfg-muser'),mpass:g('cfg-mpass'),
@@ -350,6 +364,8 @@ static void handleMask() {
 
 static void handleGetConfig() {
   JsonDocument doc;
+  doc["shelly_enabled"] = shellyEnabled();
+  doc["shelly_id"] = shellyDeviceId();
   doc["ssid"]        = g_cfg.wifiSsid;
   doc["host"]        = g_cfg.hostname;
   doc["mbroker"]     = g_cfg.mqttBroker;
@@ -389,6 +405,7 @@ static void handlePostConfig() {
   arg("skpass",   g_cfg.skPass);
   arg("sktoken",  g_cfg.skToken);
   arg("skvessel", g_cfg.skVesselName);
+  if (server.hasArg("shelly")) shellySetEnabled(server.arg("shelly") == "1");
   configSave();
   server.send(200, "text/plain", "saved");
   delay(500);
@@ -397,6 +414,7 @@ static void handlePostConfig() {
 
 static void handleConfigReset() {
   configReset();
+  shellyReset();
   server.send(200, "text/plain", "reset");
   delay(500);
   ESP.restart();
@@ -415,6 +433,10 @@ static void handleDiag() {
 
 // ── httpStart ─────────────────────────────────────────────────────────────────
 void httpStart() {
+  static bool registered = false;
+  if (registered) { server.begin(); return; }
+  registered = true;
+  shellyRegisterHttpRoutes();
   server.on("/",                   HTTP_GET,  handleIndex);
   server.on("/api/state",          HTTP_GET,  handleState);
   server.on("/api/relay",          HTTP_GET,  handleRelay);
