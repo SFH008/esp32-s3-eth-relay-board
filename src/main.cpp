@@ -29,6 +29,7 @@
 #include "MqttManager.h"
 #include "SignalKClient.h"
 #include "HttpHandlers.h"
+#include "ShellyRpc.h"
 #include "RgbLed_WS2812.h"
 #include "time.h"
 
@@ -142,6 +143,7 @@ static bool bringupAP_() {
 }
 
 static void otaBegin() {
+  ArduinoOTA.setMdnsEnabled(false); // ShellyRpc owns the shared mDNS responder
   ArduinoOTA.setPort(3232);
   ArduinoOTA.setHostname(g_cfg.hostname.c_str());
   ArduinoOTA
@@ -194,7 +196,7 @@ void setup() {
 
   startServer();
   otaBegin();
-  if (g_mode != MODE_AP) MDNS.begin(g_cfg.hostname.c_str());
+  shellyBegin();
 
   // Start background tasks on core 0 (skip in AP mode — no broker reachable)
   if (g_mode != MODE_AP) {
@@ -216,6 +218,7 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
+  shellyLoop();
   server.handleClient();
   ArduinoOTA.handle();
   rgb.tick();
@@ -259,6 +262,7 @@ void loop() {
                   : (g_mode == MODE_AP)  ? WiFi.softAPIP()
                   :                        WiFi.localIP();
   if (g_mode != lastMode || curIP != lastIP) {
+    if (lastMode != 255) shellyNetworkChanged();
     lastMode = g_mode; lastIP = curIP;
     rgb.setForMask(g_mode);
     LOGf("[NET] %s @ %s",

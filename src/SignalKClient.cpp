@@ -41,6 +41,8 @@
 
 #include <WebSocketsClient.h>
 #include <HTTPClient.h>
+#include <WiFi.h>
+#include <ETH.h>
 #include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -63,7 +65,6 @@ struct SkMsg {
 enum SkState : uint8_t {
   SK_DISCONNECTED,
   SK_CONNECTING,
-  SK_AUTHENTICATING,
   SK_RUNNING,
 };
 
@@ -74,6 +75,7 @@ static QueueHandle_t     s_queue         = nullptr;
 static SemaphoreHandle_t s_wsMutex       = nullptr;
 static volatile SkState  s_state              = SK_DISCONNECTED;
 static volatile bool     s_connected          = false;
+static String s_authHeaders; // must outlive the upgrade request
 static volatile bool     s_snapshotPending    = false;
 static volatile bool     s_tokenRefreshNeeded = false;  // set when server rejects token
 
@@ -104,20 +106,21 @@ static void wsEventHandler(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_DISCONNECTED:
       s_connected = false;
       s_state     = SK_DISCONNECTED;
-      LOG("[SK] Disconnected");
+      if (length && payload) {
+        String reason; reason.concat((const char*)payload, length);
+        LOGf("[SK] Disconnected: %.120s", reason.c_str());
+        if (reason.indexOf("HTTP 401") >= 0 || reason.indexOf("HTTP 403") >= 0)
+          s_tokenRefreshNeeded = g_cfg.skToken.length() > 0;
+      } else LOG("[SK] Disconnected");
       break;
 
     case WStype_CONNECTED:
-      LOGf("[SK] WebSocket connected to %s", (char*)payload);
-      if (g_cfg.skToken.length() > 0) {
-        s_state = SK_AUTHENTICATING;
-        LOGf("[SK] Token present (%u chars) — will authenticate", g_cfg.skToken.length());
-      } else {
-        LOG("[SK] No token configured — proceeding unauthenticated");
-        s_state           = SK_RUNNING;
-        s_connected       = true;
-        s_snapshotPending = true;  // task loop sends snapshot safely after loop() returns
-      }
+      LOG("[SK] WebSocket upgrade accepted");
+      s_state = SK_RUNNING;
+      s_connected = true;
+      s_snapshotPending = true;
+      LOG(g_cfg.skToken.length() ? "[SK] Connected - Bearer header supplied"
+                                 : "[SK] Connected - no token configured");
       break;
 
     case WStype_TEXT: {
@@ -125,22 +128,12 @@ static void wsEventHandler(WStype_t type, uint8_t* payload, size_t length) {
       DeserializationError err = deserializeJson(doc, payload, length);
       if (err) { LOGf("[SK] JSON parse error: %s", err.c_str()); break; }
 
-      if (s_state == SK_AUTHENTICATING) {
-        int code = doc["statusCode"] | 0;
-        if (code == 200 || code == 0) {
-          s_state           = SK_RUNNING;
-          s_connected       = true;
-          s_snapshotPending = true;  // task loop sends snapshot safely
-          LOG("[SK] Authenticated — running");
-        } else {
-          LOGf("[SK] Auth rejected: %d %s", code,
-               doc["message"].as<const char*>() ?: "");
-          // Flag refresh needed — skStart()/loop() will call skRequestToken()
-          // then reconnect with the new token
-          s_tokenRefreshNeeded = true;
-          s_state              = SK_DISCONNECTED;
-          s_connected          = false;
-        }
+      int statusCode = doc["statusCode"] | 0;
+      if (statusCode == 401 || statusCode == 403) {
+        LOGf("[SK] Server denied access: %d", statusCode);
+        s_tokenRefreshNeeded = g_cfg.skToken.length() > 0;
+        s_state = SK_DISCONNECTED;
+        s_connected = false;
         break;
       }
 
@@ -154,6 +147,12 @@ static void wsEventHandler(WStype_t type, uint8_t* payload, size_t length) {
       }
       break;
     }
+
+    case WStype_PING:
+      // The WebSockets library answers the ping automatically.
+      break;
+    case WStype_PONG:
+      break;
 
     case WStype_ERROR:
       LOG("[SK] WebSocket error");
@@ -283,7 +282,8 @@ static void sendDelta(String json) {   // by value — sendTXT needs non-const r
 // ── Queue drain (called from SK task) ────────────────────────────────────────
 static void drainQueue() {
   SkMsg m;
-  while (xQueueReceive(s_queue, &m, 0) == pdTRUE) {
+  // Bound work so a busy publisher cannot starve ping/pong processing.
+  for (uint8_t count = 0; count < 8 && xQueueReceive(s_queue, &m, 0) == pdTRUE; ++count) {
     if (!s_connected) continue;  // drop if not ready
     switch (m.type) {
       case SkMsg::PUB_RELAY_ONE: {
@@ -486,49 +486,73 @@ bool skAccessDenied()        { return s_accessDenied; }
 bool skTokenRefreshNeeded()  { return s_tokenRefreshNeeded; }
 
 // ── FreeRTOS task ─────────────────────────────────────────────────────────────
-static void skTask(void*) {
-  uint32_t lastConnectAttempt = 0;
-  uint32_t lastHeartbeat      = 0;
-  bool     tokenSent          = false;  // guards one-shot token send per connect
+// One startup probe logs transport and HTTP status, never tokens or bodies.
+static void probeUpgrade() {
+  LOGf("[SK-DIAG] Target %s:%u; WiFi=%d ETH-link=%d; heap=%u",
+       g_cfg.skServer.c_str(), g_cfg.skPort, (int)WiFi.status(),
+       (int)ETH.linkUp(), ESP.getFreeHeap());
+  WiFiClient probe;
+  probe.setTimeout(3000);
+  if (!probe.connect(g_cfg.skServer.c_str(), g_cfg.skPort, 3000)) {
+    LOG("[SK-DIAG] TCP connect failed - check server address, port and network");
+    return;
+  }
+  String request = String("GET ") + SK_PATH + " HTTP/1.1\r\nHost: " +
+      g_cfg.skServer + ":" + String(g_cfg.skPort) +
+      "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+      "Sec-WebSocket-Version: 13\r\n"
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+  if (g_cfg.skToken.length())
+    request += "Authorization: Bearer " + g_cfg.skToken + "\r\n";
+  request += "\r\n";
+  probe.print(request);
+  request = "";
+  uint32_t start = millis();
+  while (!probe.available() && probe.connected() && millis() - start < 3000)
+    vTaskDelay(pdMS_TO_TICKS(10));
+  if (probe.available()) {
+    String line = probe.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("HTTP/1.")) LOGf("[SK-DIAG] Upgrade response: %.100s", line.c_str());
+    else LOG("[SK-DIAG] Response is not HTTP/1.x");
+  } else {
+    LOG(probe.connected() ? "[SK-DIAG] TCP connected but no HTTP response within 3s"
+                          : "[SK-DIAG] Server closed TCP without an HTTP response");
+  }
+  probe.stop();
+}
 
+static void skTask(void*) {
+  uint32_t lastHeartbeat      = 0;
+
+  probeUpgrade();
   s_ws.onEvent(wsEventHandler);
-  s_ws.setReconnectInterval(0);
-  s_ws.disableHeartbeat();
+  s_ws.setReconnectInterval(RECONNECT_INTERVAL_MS);
+  s_ws.enableHeartbeat(15000, 10000, 2);
+
+  // Initialize once. WebSocketsClient owns TCP allocation and reconnects.
+  // Repeated begin() calls can abandon sockets managed by its retry loop.
+  s_authHeaders = "";
+  if (g_cfg.skToken.length())
+    s_authHeaders = "Authorization: Bearer " + g_cfg.skToken;
+  // setExtraHeaders appends CRLF itself: do not supply a trailing CRLF.
+  s_ws.begin(g_cfg.skServer.c_str(), g_cfg.skPort, SK_PATH, "");
+  s_ws.setExtraHeaders(s_authHeaders.c_str());
+  s_state = SK_CONNECTING;
+  LOGf("[SK] Starting connection to %s:%u (retry interval %u ms)",
+       g_cfg.skServer.c_str(), g_cfg.skPort, (unsigned)RECONNECT_INTERVAL_MS);
 
   for (;;) {
-    // s_tokenRefreshNeeded is set by wsEventHandler when the server rejects
-    // our token. The actual HTTP refresh is handled by main.cpp loop() on
-    // core 1 — never call skRequestToken() from inside this task because
-    // HTTPClient allocates ~8KB internally and will fragment the heap while
-    // the WS library also holds buffers.
-
-    // Attempt connect when fully disconnected and interval elapsed
-    if (s_state == SK_DISCONNECTED &&
-        (millis() - lastConnectAttempt) >= RECONNECT_INTERVAL_MS) {
-      lastConnectAttempt = millis();
-      tokenSent          = false;
-      LOGf("[SK] Connecting to ws://%s:%u%s",
-           g_cfg.skServer.c_str(), g_cfg.skPort, SK_PATH);
-      s_state = SK_CONNECTING;
-      xSemaphoreTake(s_wsMutex, portMAX_DELAY);
-      s_ws.begin(g_cfg.skServer.c_str(), g_cfg.skPort, SK_PATH);
-      xSemaphoreGive(s_wsMutex);
+    // Token refresh is performed by main.cpp, which stops and restarts this task.
+    if (s_tokenRefreshNeeded) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
     }
 
     // Drive WebSocket state machine
     xSemaphoreTake(s_wsMutex, portMAX_DELAY);
     s_ws.loop();
     xSemaphoreGive(s_wsMutex);
-
-    // Send token AFTER s_ws.loop() returns — safe to call sendTXT here
-    if (s_state == SK_AUTHENTICATING && !tokenSent && g_cfg.skToken.length() > 0) {
-      tokenSent = true;
-      JsonDocument doc;
-      doc["token"] = g_cfg.skToken;
-      String auth; serializeJson(doc, auth);
-      sendDelta(auth);
-      LOGf("[SK] Sent auth token (%u chars)", g_cfg.skToken.length());
-    }
 
     // Send initial state snapshot after connect — 500 ms after loop() clears
     // to let the SignalK server fully register the new connection before
@@ -551,30 +575,6 @@ static void skTask(void*) {
     if (s_state == SK_DISCONNECTED) {
       s_snapshotPending = false;
       snapshotAfterMs   = 0;
-    }
-
-    // Timeout: CONNECTING for > 5 s → force back to DISCONNECTED
-    static uint32_t connectingStart = 0;
-    if (s_state == SK_CONNECTING) {
-      if (connectingStart == 0) connectingStart = millis();
-      if (millis() - connectingStart > 5000) {
-        LOG("[SK] Connection timeout — backing off");
-        xSemaphoreTake(s_wsMutex, portMAX_DELAY);
-        s_ws.disconnect();
-        xSemaphoreGive(s_wsMutex);
-        s_state         = SK_DISCONNECTED;
-        connectingStart = 0;
-      }
-    } else {
-      connectingStart = 0;
-    }
-
-    // Auth rejected — disconnect cleanly
-    if (!s_connected && s_state == SK_DISCONNECTED && tokenSent) {
-      xSemaphoreTake(s_wsMutex, portMAX_DELAY);
-      s_ws.disconnect();
-      xSemaphoreGive(s_wsMutex);
-      tokenSent = false;
     }
 
     // Drain outbound publish queue — always outside the mutex
@@ -618,7 +618,8 @@ void skStart() {
 
 void skStop() {
   if (s_task) { vTaskDelete(s_task); s_task = nullptr; }
-  if (s_connected) s_ws.disconnect();
+  // Close a connecting/failed socket too, before a refreshed-token restart.
+  s_ws.disconnect();
   s_connected = false;
   s_state     = SK_DISCONNECTED;
   LOG("[SK] Stopped");
